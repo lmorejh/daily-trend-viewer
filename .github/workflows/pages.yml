@@ -1,0 +1,36 @@
+name: 트렌드 수집 및 Pages 배포
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "23 * * * *"  # 매시 23분 (UTC 기준, 실제 실행은 몇 분 지연될 수 있음)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: 데이터 수집 및 정적 사이트 생성
+        run: python3 collect.py _site
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - name: Pages 배포
+        id: deployment
+        uses: actions/deploy-pages@v4
