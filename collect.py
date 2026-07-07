@@ -79,30 +79,50 @@ def download_images(items, field):
 
 
 def carry_forward(name, items_key, current):
-    """수집 결과가 비었으면 이전 배포 스냅샷(JSON + 로컬 이미지)을 재사용합니다."""
+    """수집 결과가 비었으면 이전 배포 스냅샷과 커밋된 시드(seed/) 중 최신 것을 재사용합니다.
+    (집 PC에서만 접근 가능한 소스(imginn 등)를 GitHub 서버가 못 가져올 때의 폴백)"""
     if current.get(items_key):
         return current
+    prev = None
     try:
         _, body = server.http_get(PAGES_BASE + "data/" + name, timeout=15)
         prev = json.loads(body.decode("utf-8"))
     except Exception:
+        pass
+    seed = None
+    try:
+        with open(os.path.join(server.BASE_DIR, "seed", name), encoding="utf-8") as f:
+            seed = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        pass
+    best, label = None, ""
+    for cand, lab in ((prev, "이전 스냅샷"), (seed, "시드")):
+        if cand and cand.get(items_key) and \
+                (best is None or cand.get("fetchedAt", 0) > best.get("fetchedAt", 0)):
+            best, label = cand, lab
+    if not best:
         return current
-    if not prev.get(items_key):
-        return current
-    for it in prev[items_key]:
-        for f in ("thumbnail", "media"):
-            v = it.get(f) or ""
-            if v.startswith("img/"):
-                dst = os.path.join(OUT, "img", v.split("/", 1)[1])
-                if not os.path.exists(dst):
-                    try:
-                        _, img = server.http_get(PAGES_BASE + v, timeout=15)
-                        with open(dst, "wb") as fh:
-                            fh.write(img)
-                    except Exception:
-                        it[f] = ""
-    print("  → %s: 이번 수집 실패, 이전 스냅샷 %d개 재사용" % (name, len(prev[items_key])))
-    return prev
+    for it in best[items_key]:
+        for fld in ("thumbnail", "media"):
+            v = it.get(fld) or ""
+            if not v.startswith("img/"):
+                continue
+            fname = v.split("/", 1)[1]
+            dst = os.path.join(OUT, "img", fname)
+            if os.path.exists(dst):
+                continue
+            seedfile = os.path.join(server.BASE_DIR, "seed", "img", fname)
+            try:
+                if os.path.exists(seedfile):
+                    shutil.copy(seedfile, dst)
+                else:
+                    _, img = server.http_get(PAGES_BASE + v, timeout=15)
+                    with open(dst, "wb") as fh:
+                        fh.write(img)
+            except Exception:
+                it[fld] = ""
+    print("  → %s: 이번 수집 실패, %s %d개 재사용" % (name, label, len(best[items_key])))
+    return best
 
 
 def build_site():
