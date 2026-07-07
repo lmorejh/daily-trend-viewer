@@ -191,7 +191,7 @@
   </div>
 
   <div id="reelsView" class="ext-section" style="display:none">
-    <p class="note">인스타그램 웹 내부 API를 통해 등록된 계정들의 최신 릴스를 가져와 조회수순으로 정렬합니다. 아래에서 즐겨보는 크리에이터 계정을 자유롭게 추가·삭제하세요.</p>
+    <p class="note">인스타그램 미러(imginn)를 통해 등록된 계정들의 최신 릴스를 좋아요·댓글 수와 함께 가져옵니다(인스타그램이 무인증 조회를 막아 미러를 사용하며, 조회수는 제공되지 않습니다). 아래에서 즐겨보는 크리에이터 계정을 자유롭게 추가·삭제하세요.</p>
     <h2 style="font-size:16px;margin-bottom:10px">👤 구독 계정</h2>
     <div class="acc-chips" id="accChips"></div>
     <div class="addbar">
@@ -201,7 +201,7 @@
     <h2 style="font-size:16px;margin:22px 0 12px">📸 인기 릴스</h2>
     <div class="sortbar">
       <div class="sortmenu" id="reelsSortMenu">
-        <button class="sorttoggle">정렬: <span class="curlabel">조회수순</span> <span class="caret">▼</span></button>
+        <button class="sorttoggle">정렬: <span class="curlabel">좋아요순</span> <span class="caret">▼</span></button>
         <div class="sortlist"></div>
       </div>
       <span class="sortcount" id="reelsCount"></span>
@@ -211,7 +211,7 @@
   </div>
 
   <div id="xView" class="ext-section" style="display:none">
-    <p class="note">트위터 임베드용 공개 API(무인증)로 구독 계정들의 최신 트윗을 참여수와 함께 가져옵니다. 아래 정렬 메뉴로 좋아요·댓글·리트윗순으로 바이럴 글을 볼 수 있습니다.</p>
+    <p class="note">nitter RSS + 트위터 임베드 CDN(무인증)으로 구독 계정들의 최신 트윗을 좋아요·댓글 수와 함께 가져옵니다(리트윗·조회수는 이 경로에 제공되지 않습니다). 아래 정렬 메뉴로 바이럴 글을 볼 수 있습니다.</p>
     <h2 style="font-size:16px;margin-bottom:10px">👤 구독 계정</h2>
     <div class="acc-chips" id="xChips"></div>
     <div class="addbar">
@@ -230,7 +230,7 @@
   </div>
 
   <div id="threadsView" class="ext-section" style="display:none">
-    <p class="note">스레드는 인스타그램(메타)과 같은 백엔드를 씁니다. 로그인 없이 실시간 조회를 시도하며, 메타의 보안 정책상 조회가 막힌 경우 계정 바로가기로 안내합니다.</p>
+    <p class="note">스레드 실시간 조회가 막힌 경우 RSSHub를 통해 최신 글(본문·이미지·링크)을 가져옵니다. 이 경로에는 좋아요 등 통계가 제공되지 않아 최신순으로 표시되며, 그마저 막히면 계정 바로가기로 안내합니다.</p>
     <h2 style="font-size:16px;margin-bottom:10px">👤 구독 계정</h2>
     <div class="acc-chips" id="thChips"></div>
     <div class="addbar">
@@ -458,7 +458,7 @@ function timeAgo(ts) {
 
 /* ---------- 인스타 릴스 탭 ---------- */
 let reelsData = [];
-const reelsState = { sort: 'views' };  // views | likes | comments
+const reelsState = { sort: 'likes' };  // likes | comments | views (미러 소스라 조회수는 없음)
 async function loadReels(force = false) {
   const status = document.getElementById('reelsStatus');
   const grid = document.getElementById('reelsGrid');
@@ -499,7 +499,7 @@ function renderReels() {
       <div class="meta">
         <div class="title"></div>
         <div class="sub">
-          <span class="${f === 'views' ? 'views' : ''}">👁️ ${fmt2(r.views)}</span>
+          ${r.views ? `<span class="${f === 'views' ? 'views' : ''}">👁️ ${fmt2(r.views)}</span>` : ''}
           <span class="${f === 'likes' ? 'views' : ''}">❤️ ${fmt2(r.likes || 0)}</span>
           <span class="${f === 'comments' ? 'views' : ''}">💬 ${fmt2(r.comments || 0)}</span>
         </div>
@@ -601,10 +601,11 @@ function postCard(p, rank, kind) {
     <div class="ptext"></div>
     ${p.media ? `<img class="pmedia" loading="lazy" src="/api/img?u=${encodeURIComponent(p.media)}" alt="">` : ''}
     <div class="pstats">
-      <span class="${active === 'likes' ? 'hot' : ''}">❤️ <b>${fmt2(p.likes)}</b></span>
-      <span class="${active === 'replies' ? 'hot' : ''}">💬 <b>${fmt2(p.replies)}</b></span>
-      <span class="${active === 'reposts' ? 'hot' : ''}">${rtIcon} <b>${fmt2(rt)}</b></span>
+      ${p.likes ? `<span class="${active === 'likes' ? 'hot' : ''}">❤️ <b>${fmt2(p.likes)}</b></span>` : ''}
+      ${p.replies ? `<span class="${active === 'replies' ? 'hot' : ''}">💬 <b>${fmt2(p.replies)}</b></span>` : ''}
+      ${rt ? `<span class="${active === 'reposts' ? 'hot' : ''}">${rtIcon} <b>${fmt2(rt)}</b></span>` : ''}
       ${p.views ? `<span class="${active === 'views' ? 'hot' : ''}">👁️ <b>${fmt2(p.views)}</b></span>` : ''}
+      <span style="margin-left:auto">원문 보기 ↗</span>
     </div>`;
   el.querySelector('.ptext').textContent = p.text;
   el.onclick = () => window.open(p.url, '_blank');

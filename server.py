@@ -4,8 +4,11 @@
 실행: python3 server.py  →  http://localhost:8778
 """
 import base64
+import datetime
 import email.utils
+import html as htmllib
 import json
+import math
 import os
 import re
 import threading
@@ -100,8 +103,17 @@ NEWS_FEEDS = [
 HF_PIPELINES = ["text-to-video", "image-to-video"]
 # 이미지 프록시로 가져올 수 있는 호스트 (핫링크/차단 우회용)
 IMG_PROXY_ALLOW = (".cdninstagram.com", ".fbcdn.net", ".ytimg.com",
-                   ".googleusercontent.com", ".twimg.com",
+                   ".googleusercontent.com", ".twimg.com", ".imginn.com",
                    ".tiktokcdn.com", ".tiktokcdn-eu.com", ".tiktokcdn-us.com")
+
+# 인스타그램이 무인증 API를 차단(429)해 미러 사이트를 사용합니다
+IMGINN_BASE = "https://imginn.com"
+# X(트위터) syndication 타임라인 API 폐쇄 대응: nitter RSS로 트윗 목록을 얻고
+# 트윗별 통계는 임베드용 공개 CDN(tweet-result)에서 가져옵니다
+NITTER_INSTANCES = ("nitter.net", "xcancel.com", "nitter.privacyredirect.com")
+RSS_UA = "Mozilla/5.0 (compatible; RSSReader/1.0)"
+# 스레드 실시간 GraphQL이 막혔을 때 사용할 RSSHub 공개 인스턴스들
+RSSHUB_INSTANCES = ("rsshub.rssforever.com", "hub.slarker.me", "rsshub.pseudoyu.com")
 
 
 def within_period(published: str, period: str) -> bool:
@@ -286,31 +298,58 @@ ACCOUNT_SOURCES = {
 }
 
 
-def fetch_ig_reels(username: str):
-    """인스타그램 웹 내부 API(무인증)로 계정의 최근 릴스를 가져옵니다."""
-    url = ("https://www.instagram.com/api/v1/users/web_profile_info/?username="
-           + quote(username))
+def _parse_imginn_time(text: str) -> int:
+    """'July 6th 2026, 06:19 pm' → epoch"""
+    t = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", text.strip())
     try:
-        data = http_json(url, headers={"x-ig-app-id": IG_APP_ID}, timeout=12)
-    except Exception:
-        return []
-    user = (data.get("data") or {}).get("user") or {}
-    reels = []
-    for edge in (user.get("edge_owner_to_timeline_media") or {}).get("edges", []):
-        n = edge.get("node", {})
-        if not n.get("is_video"):
+        return int(datetime.datetime.strptime(t, "%B %d %Y, %I:%M %p").timestamp())
+    except ValueError:
+        return 0
+
+
+def fetch_ig_reels(username: str):
+    """imginn.com(인스타그램 미러)에서 계정의 최근 릴스를 가져옵니다.
+    인스타그램이 무인증 API를 차단(429)해 미러를 사용합니다.
+    미러에는 조회수가 없어 0으로 두고, 좋아요·댓글은 상세 페이지에서 채웁니다."""
+    items = []
+    for path in ("/reels/%s/" % quote(username), "/%s/" % quote(username)):
+        try:
+            _, body = http_get(IMGINN_BASE + path, timeout=15)
+        except Exception:
             continue
-        caps = (n.get("edge_media_to_caption") or {}).get("edges") or []
-        title = caps[0]["node"]["text"].split("\n")[0][:120] if caps else ""
+        page = body.decode("utf-8", "ignore")
+        found = re.findall(
+            r'<div class="item">.*?href="/p/([^/"]+)/".*?<img src="([^"]+)"', page, re.S)
+        if found:
+            items = found[:12]
+            break
+    reels = []
+    for code, thumb in items:
+        likes = comments = taken = 0
+        title = ""
+        try:
+            _, body = http_get(IMGINN_BASE + "/p/%s/" % quote(code), timeout=15)
+            page = body.decode("utf-8", "ignore")
+            m = re.search(r'likes-count.*?<span>([\d,\.]+)</span>', page, re.S)
+            likes = parse_view_count(m.group(1)) if m else 0
+            m = re.search(r'comments-count.*?<span>([\d,\.]+)</span>', page, re.S)
+            comments = parse_view_count(m.group(1)) if m else 0
+            m = re.search(r'<div class="desc">(.*?)</div>', page, re.S)
+            if m:
+                title = htmllib.unescape(re.sub(r"<[^>]+>", "", m.group(1))).strip()
+            m = re.search(r'Posted On:\s*([^<]+)', page)
+            taken = _parse_imginn_time(m.group(1)) if m else 0
+        except Exception:
+            pass
         reels.append({
             "account": username,
-            "title": title or "(설명 없음)",
-            "views": n.get("video_view_count") or 0,
-            "likes": (n.get("edge_liked_by") or {}).get("count", 0),
-            "comments": (n.get("edge_media_to_comment") or {}).get("count", 0),
-            "thumbnail": n.get("thumbnail_src") or "",
-            "url": "https://www.instagram.com/reel/%s/" % n.get("shortcode", ""),
-            "takenAt": n.get("taken_at_timestamp") or 0,
+            "title": title.split("\n")[0][:120] or "(설명 없음)",
+            "views": 0,
+            "likes": likes,
+            "comments": comments,
+            "thumbnail": htmllib.unescape(thumb),
+            "url": "https://www.instagram.com/p/%s/" % code,
+            "takenAt": taken,
         })
     return reels
 
@@ -319,73 +358,104 @@ def get_reels(force: bool):
     accounts = load_accounts(ACCOUNTS_FILE, DEFAULT_IG_ACCOUNTS)
 
     def fetch():
-        with ThreadPoolExecutor(max_workers=6) as pool:
+        # 계정당 상세 페이지를 여러 번 조회하므로 동시성을 낮게 유지합니다
+        with ThreadPoolExecutor(max_workers=3) as pool:
             results = pool.map(fetch_ig_reels, accounts)
         merged = [r for chunk in results for r in chunk]
-        merged.sort(key=lambda r: r["views"], reverse=True)
+        merged.sort(key=lambda r: (r["views"], r["likes"]), reverse=True)
         return merged
     reels, fetched_at = cached(("reels", tuple(accounts)), force, fetch)
     return reels, accounts, fetched_at
 
 
 # ================================================================ X (트위터)
-def _find_timeline_entries(node):
-    """syndication __NEXT_DATA__에서 timeline entries 리스트를 찾습니다."""
-    if isinstance(node, dict):
-        tl = node.get("timeline")
-        if isinstance(tl, dict) and isinstance(tl.get("entries"), list):
-            return tl["entries"]
-        for v in node.values():
-            r = _find_timeline_entries(v)
-            if r:
-                return r
-    elif isinstance(node, list):
-        for v in node:
-            r = _find_timeline_entries(v)
-            if r:
-                return r
-    return None
+def _tweet_stats_token(tweet_id: str) -> str:
+    """tweet-result CDN의 공개 토큰: ((id/1e15)*pi)를 36진수로 쓰고 '0'과 '.'을 제거.
+    (트위터 임베드 위젯(react-tweet)이 쓰는 공개 알고리즘)"""
+    n = (int(tweet_id) / 1e15) * math.pi
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    i, frac = int(n), n - int(n)
+    s = "" if i else "0"
+    while i:
+        s = digits[i % 36] + s
+        i //= 36
+    s += "."
+    for _ in range(12):
+        frac *= 36
+        d = int(frac)
+        s += digits[d]
+        frac -= d
+    return re.sub(r"(0+|\.)", "", s)
+
+
+def _fetch_tweet_stats(tweet_id: str):
+    """임베드용 공개 CDN에서 트윗 1개의 본문·좋아요·댓글·미디어를 가져옵니다."""
+    url = ("https://cdn.syndication.twimg.com/tweet-result?id=%s&token=%s"
+           % (tweet_id, _tweet_stats_token(tweet_id)))
+    try:
+        return http_json(url, timeout=10)
+    except Exception:
+        return None
 
 
 def fetch_x_posts(username: str):
-    """트위터 syndication(임베드용, 무인증) API로 계정의 최근 트윗을 참여수와 함께 가져옵니다."""
-    url = "https://syndication.twitter.com/srv/timeline-profile/screen-name/" + quote(username)
-    try:
-        _, body = http_get(url, headers={"Accept": "text/html"}, timeout=12)
-        html = body.decode("utf-8", "ignore")
-        m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
-        if not m:
-            return []
-        data = json.loads(m.group(1))
-    except Exception:
-        return []
-    entries = _find_timeline_entries(data) or []
-    posts = []
-    for e in entries:
-        content = e.get("content", {}) if isinstance(e, dict) else {}
-        t = content.get("tweet")
-        if not isinstance(t, dict):
-            tr = content.get("tweetResult") or {}
-            t = tr.get("result") if isinstance(tr, dict) else None
-        if not isinstance(t, dict) or t.get("favorite_count") is None:
+    """nitter RSS로 최근 트윗 목록을 얻고, 트윗별 통계는 tweet-result CDN에서 채웁니다.
+    (기존 syndication 타임라인 API가 2026년 무인증 접근을 차단(429)한 데 대한 대응.
+    이 조합에는 리트윗·조회수가 없어 0으로 둡니다 — 좋아요·댓글은 실데이터)"""
+    xml_text = None
+    for host in NITTER_INSTANCES:
+        try:
+            _, body = http_get("https://%s/%s/rss" % (host, quote(username)),
+                               headers={"User-Agent": RSS_UA,
+                                        "Accept": "application/rss+xml, application/xml"},
+                               timeout=12)
+            if b"<item>" in body:
+                xml_text = body.decode("utf-8", "ignore")
+                break
+        except Exception:
             continue
-        user = t.get("user", {}) if isinstance(t.get("user"), dict) else {}
+    if not xml_text:
+        return []
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return []
+    DC = "{http://purl.org/dc/elements/1.1/}"
+    base = []
+    for item in root.iter("item"):
+        link = item.findtext("link") or ""
+        m = re.search(r"/status/(\d+)", link)
+        if not m:
+            continue
+        creator = (item.findtext(DC + "creator") or "").lstrip("@")
+        if creator and creator.lower() != username.lower():
+            continue  # 리트윗 제외
+        base.append({"id": m.group(1),
+                     "title": item.findtext("title") or "",
+                     "createdAt": item.findtext("pubDate") or ""})
+    base = base[:12]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        stats = list(pool.map(lambda p: _fetch_tweet_stats(p["id"]), base))
+    posts = []
+    for p, d in zip(base, stats):
+        d = d or {}
         media = ""
-        for mm in (t.get("mediaDetails") or []):
+        for mm in (d.get("mediaDetails") or []):
             if mm.get("media_url_https"):
                 media = mm["media_url_https"]
                 break
+        user = d.get("user") or {}
         posts.append({
             "account": username,
             "name": user.get("name", username),
-            "text": (t.get("full_text") or t.get("text") or "").strip(),
-            "likes": t.get("favorite_count") or 0,
-            "replies": t.get("reply_count") or 0,
-            "retweets": t.get("retweet_count") or 0,
-            "views": int(t.get("views", {}).get("count", 0)) if isinstance(t.get("views"), dict) else 0,
+            "text": (d.get("text") or p["title"]).strip(),
+            "likes": d.get("favorite_count") or 0,
+            "replies": d.get("conversation_count") or 0,
+            "retweets": 0,
+            "views": 0,
             "media": media,
-            "url": "https://x.com/%s/status/%s" % (username, t.get("id_str", "")),
-            "createdAt": t.get("created_at", ""),
+            "url": "https://x.com/%s/status/%s" % (username, p["id"]),
+            "createdAt": d.get("created_at") or p["createdAt"],
         })
     return posts
 
@@ -430,10 +500,49 @@ THREADS_DOC_IDS = [
 ]
 
 
+def _fetch_threads_rsshub(username: str):
+    """RSSHub 공개 인스턴스로 스레드 글을 가져옵니다(폴백).
+    RSS에는 좋아요·댓글 수가 없어 통계는 0으로 둡니다 — 본문·링크·이미지는 실데이터."""
+    for host in RSSHUB_INSTANCES:
+        try:
+            _, body = http_get("https://%s/threads/%s" % (host, quote(username)),
+                               headers={"User-Agent": RSS_UA}, timeout=20)
+        except Exception:
+            continue
+        if b"<item>" not in body:
+            continue
+        try:
+            root = ET.fromstring(body.decode("utf-8", "ignore"))
+        except ET.ParseError:
+            continue
+        posts = []
+        for item in root.iter("item"):
+            desc = item.findtext("description") or ""
+            text = htmllib.unescape(re.sub(r"<[^>]+>", " ", desc)).strip()
+            text = re.sub(r"\s+", " ", text) or (item.findtext("title") or "")
+            text = re.sub(r"^@?%s\s*:\s*" % re.escape(username), "", text, flags=re.I)
+            m = re.search(r'<img[^>]+src="([^"]+)"', desc)
+            pub = item.findtext("pubDate") or ""
+            try:
+                ts = int(email.utils.parsedate_to_datetime(pub).timestamp())
+            except (TypeError, ValueError):
+                ts = 0
+            posts.append({
+                "account": username, "text": text[:280],
+                "likes": 0, "replies": 0, "reposts": 0, "views": 0,
+                "media": htmllib.unescape(m.group(1)) if m else "",
+                "url": item.findtext("link") or "https://www.threads.com/@" + username,
+                "createdAt": ts,
+            })
+        if posts:
+            return posts
+    return []
+
+
 def fetch_threads_posts(username: str):
     lsd, user_id = _threads_lsd_and_userid(username)
     if not lsd or not user_id:
-        return []
+        return _fetch_threads_rsshub(username)
     from urllib.parse import urlencode
     headers = {
         "X-FB-LSD": lsd, "X-IG-App-ID": IG_APP_ID_THREADS,
@@ -460,7 +569,7 @@ def fetch_threads_posts(username: str):
         posts = _parse_threads(data, username)
         if posts:
             return posts
-    return []
+    return _fetch_threads_rsshub(username)
 
 
 def _parse_threads(data, username):

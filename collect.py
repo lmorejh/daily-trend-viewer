@@ -19,6 +19,8 @@ import server
 OUT = sys.argv[1] if len(sys.argv) > 1 else "_site"
 PERIODS = ("day", "week", "month")
 IMG_LIMIT = 400  # 스냅샷당 내려받는 썸네일 최대 개수
+# 수집이 실패(0개)한 소스는 이전 배포 스냅샷을 재사용합니다
+PAGES_BASE = os.environ.get("PAGES_BASE", "https://lmorejh.github.io/daily-trend-viewer/")
 
 # static_shim.js의 SLUG와 반드시 일치해야 합니다 (파일명에 쓸 영문 슬러그)
 CATEGORY_SLUGS = {
@@ -76,6 +78,33 @@ def download_images(items, field):
     return len(mapping)
 
 
+def carry_forward(name, items_key, current):
+    """수집 결과가 비었으면 이전 배포 스냅샷(JSON + 로컬 이미지)을 재사용합니다."""
+    if current.get(items_key):
+        return current
+    try:
+        _, body = server.http_get(PAGES_BASE + "data/" + name, timeout=15)
+        prev = json.loads(body.decode("utf-8"))
+    except Exception:
+        return current
+    if not prev.get(items_key):
+        return current
+    for it in prev[items_key]:
+        for f in ("thumbnail", "media"):
+            v = it.get(f) or ""
+            if v.startswith("img/"):
+                dst = os.path.join(OUT, "img", v.split("/", 1)[1])
+                if not os.path.exists(dst):
+                    try:
+                        _, img = server.http_get(PAGES_BASE + v, timeout=15)
+                        with open(dst, "wb") as fh:
+                            fh.write(img)
+                    except Exception:
+                        it[f] = ""
+    print("  → %s: 이번 수집 실패, 이전 스냅샷 %d개 재사용" % (name, len(prev[items_key])))
+    return prev
+
+
 def build_site():
     base = server.BASE_DIR
     with open(os.path.join(base, "index.html"), encoding="utf-8") as f:
@@ -101,24 +130,32 @@ def main():
     reels, accounts, fetched = server.get_reels(False)
     reels = reels[:80]
     n = download_images(reels, "thumbnail")
-    write_json("reels.json", {"reels": reels, "accounts": accounts, "fetchedAt": fetched})
-    print("릴스: %d개 (썸네일 %d개)" % (len(reels), n))
+    data = carry_forward("reels.json", "reels",
+                         {"reels": reels, "accounts": accounts, "fetchedAt": fetched})
+    write_json("reels.json", data)
+    print("릴스: %d개 (썸네일 %d개)" % (len(data["reels"]), n))
 
     posts, accounts, fetched = server.get_x_posts(False)
     n = download_images(posts, "media")
-    write_json("x.json", {"posts": posts, "accounts": accounts, "fetchedAt": fetched})
-    print("X: %d개 (이미지 %d개)" % (len(posts), n))
+    data = carry_forward("x.json", "posts",
+                         {"posts": posts, "accounts": accounts, "fetchedAt": fetched})
+    write_json("x.json", data)
+    print("X: %d개 (이미지 %d개)" % (len(data["posts"]), n))
 
     posts, accounts, fetched = server.get_threads_posts(False)
     n = download_images(posts, "media")
-    write_json("threads.json", {"posts": posts, "accounts": accounts, "fetchedAt": fetched})
-    print("스레드: %d개 (이미지 %d개)" % (len(posts), n))
+    data = carry_forward("threads.json", "posts",
+                         {"posts": posts, "accounts": accounts, "fetchedAt": fetched})
+    write_json("threads.json", data)
+    print("스레드: %d개 (이미지 %d개)" % (len(data["posts"]), n))
 
     posts, accounts, fetched = server.get_tiktok(False)
     posts = posts[:100]
     n = download_images(posts, "thumbnail")
-    write_json("tiktok.json", {"posts": posts, "accounts": accounts, "fetchedAt": fetched})
-    print("틱톡: %d개 (썸네일 %d개)" % (len(posts), n))
+    data = carry_forward("tiktok.json", "posts",
+                         {"posts": posts, "accounts": accounts, "fetchedAt": fetched})
+    write_json("tiktok.json", data)
+    print("틱톡: %d개 (썸네일 %d개)" % (len(data["posts"]), n))
 
     data, fetched = server.get_ai_data(False)
     write_json("ai.json", {**data, "fetchedAt": fetched})
